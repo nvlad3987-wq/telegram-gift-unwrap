@@ -1,0 +1,115 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.designers.giftunwrap.demo'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'com.designers.giftunwrap.demo'
+        minSdk 24
+        targetSdk 35
+        versionCode 1
+        versionName '1.0'
+    }
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+    testOptions {
+        unitTests {
+            includeAndroidResources = true
+            all {
+                maxHeapSize = '3g'
+                testLogging {
+                    events 'passed', 'failed', 'standard_out', 'standard_error'
+                    exceptionFormat 'full'
+                }
+            }
+        }
+    }
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+dependencies {
+    implementation project(':giftunwrap')
+
+    // FlowRenderTest: plays the demo with real touches and renders every frame.
+    testImplementation 'junit:junit:4.13.2'
+    testImplementation 'org.robolectric:robolectric:4.14.1'
+}
+
+// Runs FlowRenderTest inside the Gradle daemon instead of a forked test JVM: on Windows a
+// non-ASCII user name (C:\Users\Владислав) breaks Gradle's forked test workers.
+// Frames go to <project>/frames.  Android Studio: Run ▸ "Render flow (test)".
+tasks.register('renderFlow') {
+    def unitTest = tasks.named('testDebugUnitTest')
+    dependsOn { unitTest.get().classpath }
+    doLast {
+        def cp = unitTest.get().classpath.files.toList()
+        // AGP writes test_config.properties with paths relative to this module; a forked test
+        // JVM starts here, the daemon does not. Put an absolute-path copy first on the classpath.
+        def rel = 'com/android/tools/test_config.properties'
+        def agpDir = cp.find { new File(it, rel).exists() }
+        if (agpDir != null) {
+            def props = new Properties()
+            new File(agpDir, rel).withInputStream { props.load(it) }
+            props.stringPropertyNames().each { k ->
+                def v = props.getProperty(k)
+                if ((v.contains('/') || v.contains('\\')) && !new File(v).isAbsolute()) {
+                    props.setProperty(k, file(v).absolutePath)
+                }
+            }
+            def fixed = layout.buildDirectory.dir('renderFlowConfig').get().asFile
+            def target = new File(fixed, rel)
+            target.parentFile.mkdirs()
+            target.withOutputStream { props.store(it, 'absolute paths for renderFlow') }
+            cp.add(0, fixed)
+            println("test config: " + props)
+        }
+        // Load jars from copies: the daemon keeps a loaded jar open, and Windows would then
+        // refuse to rebuild it on the next run.
+        def copies = new File(System.getProperty('java.io.tmpdir'), "renderFlow-${System.currentTimeMillis()}")
+        copies.mkdirs()
+        cp = cp.withIndex().collect { f, i ->
+            if (f.isFile()) {
+                def c = new File(copies, "${i}_${f.name}")
+                java.nio.file.Files.copy(f.toPath(), c.toPath())
+                return c
+            }
+            return f
+        }
+        def loader = new URLClassLoader(cp.collect { it.toURI().toURL() } as URL[], ClassLoader.platformClassLoader)
+        // Robolectric registers Conscrypt globally; drop a stale one left by an earlier run.
+        java.security.Security.removeProvider('Conscrypt')
+        def thread = Thread.currentThread()
+        def previous = thread.contextClassLoader
+        thread.contextClassLoader = loader
+        System.setProperty('flow.out', rootProject.file('frames').absolutePath)
+        try {
+            def core = loader.loadClass('org.junit.runner.JUnitCore')
+            def test = loader.loadClass('com.designers.giftunwrap.demo.FlowRenderTest')
+            def result = core.getMethod('runClasses', Class[].class).invoke(null, [[test] as Class[]] as Object[])
+            result.failures.each { println(it.trace) }
+            println("FlowRenderTest: run ${result.runCount}, failed ${result.failureCount}")
+            if (!result.wasSuccessful()) {
+                throw new GradleException("FlowRenderTest failed: " + result.failures.collect { it.message }.join('; '))
+            }
+        } finally {
+            thread.contextClassLoader = previous
+            loader.close()
+            java.security.Security.removeProvider('Conscrypt')
+        }
+    }
+}
+
+// "Render flow (test)" in Android Studio runs testDebugUnitTest; route it through renderFlow.
+tasks.matching { it.name == 'testDebugUnitTest' }.configureEach {
+    dependsOn 'renderFlow'
+    enabled = false
+}
